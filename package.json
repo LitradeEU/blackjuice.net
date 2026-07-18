@@ -1,0 +1,11 @@
+{
+  "name": "blackjuice",
+  "version": "1.0.0",
+  "private": true,
+  "scripts": {
+    "build": "node scripts/build.mjs"
+  },
+  "devDependencies": {
+    "vite": "8.1.5"
+  }
+}
