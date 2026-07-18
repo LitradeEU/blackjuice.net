@@ -1,4 +1,4 @@
-import { cp, mkdir, rm, writeFile } from "node:fs/promises";
+import { access, cp, mkdir, rm, writeFile } from "node:fs/promises";
 import { resolve } from "node:path";
 import { build } from "vite";
 
@@ -16,10 +16,15 @@ await build({
 });
 
 await mkdir(resolve(dist, "server"), { recursive: true });
-await mkdir(resolve(dist, ".openai"), { recursive: true });
-await cp(resolve(root, ".openai", "hosting.json"), resolve(dist, ".openai", "hosting.json"), {
-  recursive: false,
-});
+const hostingConfig = resolve(root, ".openai", "hosting.json");
+
+try {
+  await access(hostingConfig);
+  await mkdir(resolve(dist, ".openai"), { recursive: true });
+  await cp(hostingConfig, resolve(dist, ".openai", "hosting.json"), { recursive: false });
+} catch (error) {
+  if (error.code !== "ENOENT") throw error;
+}
 
 await writeFile(
   resolve(dist, "server", "index.js"),
