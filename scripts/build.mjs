@@ -9,6 +9,7 @@ await rm(dist, { recursive: true, force: true });
 
 await build({
   root,
+  base: process.env.GITHUB_ACTIONS === "true" ? "/blackjuice.net/" : "/",
   build: {
     emptyOutDir: false,
     outDir: resolve(dist, "client"),
