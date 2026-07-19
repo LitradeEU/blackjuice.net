@@ -902,7 +902,8 @@ body.is-scrolled .site-header {
 
 .composer-panel,
 .analytics-panel,
-.library-panel {
+.library-panel,
+.remote-archive-panel {
   background: rgba(16, 16, 16, 0.78);
   border: 1px solid rgba(255, 255, 255, 0.13);
   border-radius: 8px;
@@ -913,6 +914,34 @@ body.is-scrolled .site-header {
 
 .library-panel {
   background: var(--surface);
+}
+
+.remote-archive-panel {
+  align-items: center;
+  display: flex;
+  gap: 24px;
+  justify-content: space-between;
+}
+
+.remote-archive-panel h2 {
+  font-family: var(--font-display);
+  font-size: 28px;
+  font-weight: 700;
+  line-height: 1;
+  margin: 8px 0 0;
+  overflow-wrap: anywhere;
+}
+
+.remote-archive-panel:has(.remote-auth-form) {
+  align-items: stretch;
+  display: block;
+}
+
+.remote-auth-form {
+  align-items: end;
+  display: grid;
+  gap: 14px;
+  grid-template-columns: minmax(0, 1fr) minmax(0, 1fr) auto;
 }
 
 .panel-heading {
@@ -1446,8 +1475,20 @@ body.is-scrolled .site-header {
 
   .composer-panel,
   .analytics-panel,
-  .library-panel {
+  .library-panel,
+  .remote-archive-panel {
     padding: 18px;
+  }
+
+  .remote-archive-panel {
+    align-items: start;
+    flex-direction: column;
+  }
+
+  .remote-auth-form {
+    align-items: stretch;
+    grid-template-columns: 1fr;
+    width: 100%;
   }
 
   .panel-heading,
