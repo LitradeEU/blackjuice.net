@@ -89,6 +89,22 @@ function publishedPosts() {
     .sort((a, b) => new Date(`${b.date}T${b.time || "00:00"}`) - new Date(`${a.date}T${a.time || "00:00"}`));
 }
 
+function collectionGroups(posts) {
+  const groups = new Map();
+
+  posts.forEach((post) => {
+    const name = String(post.collection || "").trim();
+    const id = slugify(name);
+    if (!id) return;
+
+    const group = groups.get(id) || { id, name, posts: [] };
+    group.posts.push(post);
+    groups.set(id, group);
+  });
+
+  return [...groups.values()].sort((a, b) => b.posts.length - a.posts.length || a.name.localeCompare(b.name, "it"));
+}
+
 function formatDate(value, withYear = true) {
   if (!value) return "";
   return new Intl.DateTimeFormat("it-IT", {
@@ -162,6 +178,11 @@ function route() {
     return;
   }
 
+  if (hash.startsWith("#collection/")) {
+    renderHome("archive", slugify(hash.replace("#collection/", "")));
+    return;
+  }
+
   if (hash === "#creator") {
     if (isCreatorAuthorized()) {
       renderCreator();
@@ -217,12 +238,14 @@ function footerMarkup() {
   `;
 }
 
-function renderHome(scrollTarget) {
+function renderHome(scrollTarget, selectedCollectionId = "") {
   trackRouteLeave();
   appState.currentPostId = null;
-  const posts = publishedPosts();
+  const allPosts = publishedPosts();
+  const collections = collectionGroups(allPosts);
+  const activeCollection = collections.find((collection) => collection.id === selectedCollectionId) || null;
+  const posts = activeCollection ? activeCollection.posts : allPosts;
   const [lead, second, third] = posts;
-  const archivePosts = posts.slice(0, 8);
 
   mount(`
     ${headerMarkup("home")}
@@ -244,10 +267,23 @@ function renderHome(scrollTarget) {
         }
       </section>
 
+      <section class="collections-section" id="collections" data-reveal>
+        <div class="section-label">
+          <h2>Raccolte</h2>
+          <span>${collections.length}</span>
+        </div>
+        <div class="collection-grid">
+          ${collections.length ? collections.map((collection) => collectionCard(collection, activeCollection?.id)).join("") : emptyState("Nessuna raccolta", "collection-empty")}
+        </div>
+      </section>
+
       <section class="feed-section" id="archive" data-reveal>
         <div class="section-label">
-          <h2>Pubblicazioni</h2>
-          <span>${posts.length}</span>
+          <h2>${escapeHtml(activeCollection?.name || "Pubblicazioni")}</h2>
+          <div class="section-tools">
+            <span>${posts.length}</span>
+            ${activeCollection ? '<a class="collection-clear" href="#home">Tutte</a>' : ""}
+          </div>
         </div>
         <div class="article-feed">
           ${posts.length ? posts.slice(0, 9).map(articleCard).join("") : emptyState("Archivio vuoto", "feed-empty")}
@@ -308,6 +344,32 @@ function articleCard(post) {
       </div>
     </article>
   `;
+}
+
+function collectionCard(collection, activeCollectionId) {
+  const isActive = collection.id === activeCollectionId;
+  const totalLabel = collection.posts.length === 1 ? "1 pubblicazione" : `${collection.posts.length} pubblicazioni`;
+
+  return `
+    <a class="collection-card ${isActive ? "is-active" : ""}" href="#collection/${collection.id}" ${isActive ? 'aria-current="page"' : ""}>
+      <div class="collection-card-heading">
+        <p>Raccolta</p>
+        <span>${escapeHtml(totalLabel)}</span>
+      </div>
+      <h3>${escapeHtml(collection.name)}</h3>
+      <div class="collection-covers" aria-hidden="true">
+        ${collection.posts.slice(0, 3).map(collectionCoverThumb).join("")}
+      </div>
+    </a>
+  `;
+}
+
+function collectionCoverThumb(post) {
+  if (post.image) {
+    return `<img src="${post.image}" alt="">`;
+  }
+
+  return `<span class="collection-cover-thumb tone-${escapeHtml(post.coverTone || "ink")}">${escapeHtml(initials(post.title || "BJ"))}</span>`;
 }
 
 function emptyState(title, className = "") {
@@ -430,6 +492,7 @@ function renderCreator() {
             ${field("title", "Titolo", draft.title, "text", "Titolo della pubblicazione")}
             ${field("subtitle", "Sottotitolo", draft.subtitle)}
             ${field("category", "Categoria", draft.category)}
+            ${field("collection", "Raccolta", draft.collection)}
             ${field("author", "Autore", draft.author)}
             ${field("date", "Data", draft.date, "date")}
             ${field("time", "Ora", draft.time, "time")}
@@ -560,6 +623,7 @@ function createEmptyDraft() {
     title: "",
     subtitle: "",
     category: "",
+    collection: "",
     author: "",
     date: new Date().toISOString().slice(0, 10),
     time: "09:00",
@@ -580,6 +644,7 @@ function getFormDraft(form) {
   const body = normalizeArticleText(String(data.get("body") || "")).trim();
   const readingMinutes = Number(data.get("readingMinutes")) || estimateReadMinutes(body);
   const category = String(data.get("category") || "").trim();
+  const collection = String(data.get("collection") || "").trim();
 
   return {
     id: existingId || slugify(title || `pubblicazione-${Date.now()}`),
@@ -587,6 +652,7 @@ function getFormDraft(form) {
     title,
     subtitle: String(data.get("subtitle") || "").trim(),
     category,
+    collection,
     author: String(data.get("author") || "").trim(),
     date: String(data.get("date") || new Date().toISOString().slice(0, 10)),
     time: String(data.get("time") || "09:00"),
@@ -712,12 +778,17 @@ function creatorPreview(post) {
 }
 
 function libraryRow(post) {
+  const details = [formatDate(post.date), post.collection, post.category, post.place || "Nessun luogo"]
+    .filter(Boolean)
+    .map((value) => escapeHtml(value))
+    .join(" · ");
+
   return `
     <article class="library-row" data-post-id="${escapeHtml(post.id)}">
       <div>
         <span class="status-dot ${post.status}">${escapeHtml(post.status)}</span>
         <h3>${escapeHtml(post.title || "Senza titolo")}</h3>
-        <p>${escapeHtml(formatDate(post.date))} · ${escapeHtml(post.category)} · ${escapeHtml(post.place || "Nessun luogo")}</p>
+        <p>${details}</p>
       </div>
       <div class="button-row">
         ${post.status === "published" ? `<a class="pill-button ghost" href="#post/${post.id}">Apri</a>` : ""}
