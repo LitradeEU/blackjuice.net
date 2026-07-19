@@ -4,9 +4,6 @@ import { supabaseConfig } from "./supabase-config.js";
 const STORAGE_KEY = "blackjuice.posts.v1";
 const ANALYTICS_KEY = "blackjuice.analytics.v1";
 const DRAFT_KEY = "blackjuice.creatorDraft.v1";
-const CREATOR_SESSION_KEY = "blackjuice.creatorSession.v1";
-const CREATOR_PASSWORD_HASH = "e92674ce3b32871686eec4b520726b13e56a149cbd8af0d78f4737f486ea2487";
-const CREATOR_SESSION_DURATION = 12 * 60 * 60 * 1000;
 const COVER_MAX_EDGE = 1600;
 const COVER_MAX_DATA_URL_LENGTH = 2_400_000;
 const STORAGE_DATABASE = "blackjuice.creator.v1";
@@ -419,7 +416,7 @@ function route() {
   }
 
   if (hash === "#creator") {
-    if (isCreatorAuthorized()) {
+    if (appState.remote.authenticated && appState.remote.isCreator) {
       renderCreator();
     } else {
       renderCreatorAccess();
@@ -807,8 +804,12 @@ function renderCreatorAccess() {
         <h1>Accesso riservato</h1>
         <form id="creatorAccessForm">
           <label class="field">
+            <span>Email</span>
+            <input name="email" type="email" autocomplete="email" required autofocus>
+          </label>
+          <label class="field">
             <span>Password</span>
-            <input id="creatorPassword" name="password" type="password" autocomplete="current-password" required autofocus>
+            <input name="password" type="password" autocomplete="current-password" required>
           </label>
           <button class="pill-button light" type="submit">Accedi</button>
           <p class="access-feedback" id="creatorAccessFeedback" aria-live="polite"></p>
@@ -819,18 +820,33 @@ function renderCreatorAccess() {
 
   document.getElementById("creatorAccessForm").addEventListener("submit", async (event) => {
     event.preventDefault();
-    const password = document.getElementById("creatorPassword").value;
+    const form = new FormData(event.currentTarget);
     const feedback = document.getElementById("creatorAccessFeedback");
 
-    if (await passwordMatches(password)) {
-      sessionStorage.setItem(CREATOR_SESSION_KEY, String(Date.now() + CREATOR_SESSION_DURATION));
-      feedback.textContent = "Accesso effettuato.";
-      renderCreator();
+    if (!remoteArchive) {
+      feedback.textContent = "Archivio remoto non configurato.";
       return;
     }
 
-    feedback.textContent = "Password non corretta.";
-    document.getElementById("creatorPassword").select();
+    const { error } = await remoteArchive.auth.signInWithPassword({
+      email: String(form.get("email") || "").trim(),
+      password: String(form.get("password") || ""),
+    });
+
+    if (error) {
+      feedback.textContent = error.message || "Accesso non riuscito.";
+      return;
+    }
+
+    const remote = await refreshRemoteSession();
+    if (!remote.isCreator) {
+      await remoteArchive.auth.signOut();
+      await refreshRemoteSession();
+      feedback.textContent = "Questo account non puo pubblicare nell'archivio.";
+      return;
+    }
+
+    renderCreator();
   });
 }
 
@@ -887,21 +903,6 @@ function renderPasswordRecovery() {
     route();
     toast("Password impostata.");
   });
-}
-
-function isCreatorAuthorized() {
-  const expiresAt = Number(sessionStorage.getItem(CREATOR_SESSION_KEY));
-  if (expiresAt > Date.now()) return true;
-  sessionStorage.removeItem(CREATOR_SESSION_KEY);
-  return false;
-}
-
-async function passwordMatches(password) {
-  if (!window.crypto?.subtle) return false;
-  const bytes = new TextEncoder().encode(password);
-  const digest = await window.crypto.subtle.digest("SHA-256", bytes);
-  const actualHash = Array.from(new Uint8Array(digest), (byte) => byte.toString(16).padStart(2, "0")).join("");
-  return actualHash === CREATOR_PASSWORD_HASH;
 }
 
 function field(name, label, value, type = "text", placeholder = "") {
@@ -1074,39 +1075,15 @@ function creatorPreview(post) {
 }
 
 function remoteArchiveMarkup() {
-  if (!remoteArchive) return "";
-
-  if (appState.remote.authenticated) {
-    return `
-      <section class="remote-archive-panel" data-reveal>
-        <div>
-          <p class="eyebrow">Archivio remoto</p>
-          <h2>${escapeHtml(appState.remote.email)}</h2>
-        </div>
-        <button class="pill-button ghost" type="button" id="remoteSignOut">Esci</button>
-      </section>
-    `;
-  }
+  if (!remoteArchive || !appState.remote.authenticated) return "";
 
   return `
     <section class="remote-archive-panel" data-reveal>
-      <div class="panel-heading">
-        <div>
-          <p class="eyebrow">Archivio remoto</p>
-          <h2>Accesso</h2>
-        </div>
+      <div>
+        <p class="eyebrow">Archivio remoto</p>
+        <h2>${escapeHtml(appState.remote.email)}</h2>
       </div>
-      <form class="remote-auth-form" id="remoteAuthForm">
-        <label class="field">
-          <span>Email</span>
-          <input name="email" type="email" autocomplete="email" required>
-        </label>
-        <label class="field">
-          <span>Password</span>
-          <input name="password" type="password" autocomplete="current-password" required>
-        </label>
-        <button class="pill-button light" type="submit">Accedi</button>
-      </form>
+      <button class="pill-button ghost" type="button" id="remoteSignOut">Esci</button>
     </section>
   `;
 }
@@ -1267,24 +1244,6 @@ function bindCreator() {
       });
   });
 
-  document.getElementById("remoteAuthForm")?.addEventListener("submit", async (event) => {
-    event.preventDefault();
-    const data = new FormData(event.currentTarget);
-    const { error } = await remoteArchive.auth.signInWithPassword({
-      email: String(data.get("email") || "").trim(),
-      password: String(data.get("password") || ""),
-    });
-
-    if (error) {
-      toast(error.message || "Accesso non riuscito.");
-      return;
-    }
-
-    const remote = await refreshRemoteSession();
-    renderCreator();
-    toast(remote.isCreator ? "Archivio remoto connesso." : "Account senza permessi di pubblicazione.");
-  });
-
   creatorShell.addEventListener("click", async (event) => {
     const button = event.target.closest?.("button");
     if (!button) return;
@@ -1292,7 +1251,7 @@ function bindCreator() {
     if (button.id === "remoteSignOut") {
       await remoteArchive.auth.signOut();
       await refreshRemoteSession();
-      renderCreator();
+      route();
       toast("Disconnesso dall'archivio remoto.");
       return;
     }
