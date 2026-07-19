@@ -15,9 +15,18 @@ const volatileStorage = new Map();
 let storageDatabasePromise = null;
 const remoteArchive = isRemoteConfigured()
   ? createClient(supabaseConfig.url, supabaseConfig.publishableKey, {
-      auth: { detectSessionInUrl: false },
+      auth: { detectSessionInUrl: true },
     })
   : null;
+let recoverySessionPending = false;
+
+if (remoteArchive) {
+  remoteArchive.auth.onAuthStateChange((event) => {
+    if (event !== "PASSWORD_RECOVERY") return;
+    recoverySessionPending = true;
+    window.setTimeout(route, 0);
+  });
+}
 
 const demoPostIds = new Set([
   "manifesto-liquido",
@@ -393,6 +402,11 @@ function estimateReadMinutes(text = "") {
 }
 
 function route() {
+  if (isPasswordRecovery()) {
+    renderPasswordRecovery();
+    return;
+  }
+
   const hash = window.location.hash || "#home";
   if (hash.startsWith("#post/")) {
     renderPost(hash.replace("#post/", ""));
@@ -424,6 +438,10 @@ function route() {
   }
 
   renderHome();
+}
+
+function isPasswordRecovery() {
+  return Boolean(remoteArchive && (recoverySessionPending || new URLSearchParams(window.location.search).get("recovery") === "1"));
 }
 
 function mount(shell) {
@@ -813,6 +831,61 @@ function renderCreatorAccess() {
 
     feedback.textContent = "Password non corretta.";
     document.getElementById("creatorPassword").select();
+  });
+}
+
+function renderPasswordRecovery() {
+  mount(`
+    ${headerMarkup("creator")}
+    <main class="creator-access-shell">
+      <section class="creator-access-panel" data-reveal>
+        <p class="eyebrow">Archivio remoto</p>
+        <h1>Imposta password</h1>
+        <form id="passwordRecoveryForm">
+          <label class="field">
+            <span>Nuova password</span>
+            <input name="password" type="password" autocomplete="new-password" minlength="12" required autofocus>
+          </label>
+          <label class="field">
+            <span>Conferma password</span>
+            <input name="confirmation" type="password" autocomplete="new-password" minlength="12" required>
+          </label>
+          <button class="pill-button light" type="submit">Salva password</button>
+          <p class="access-feedback" id="passwordRecoveryFeedback" aria-live="polite"></p>
+        </form>
+      </section>
+    </main>
+  `);
+
+  document.getElementById("passwordRecoveryForm").addEventListener("submit", async (event) => {
+    event.preventDefault();
+    const form = new FormData(event.currentTarget);
+    const password = String(form.get("password") || "");
+    const confirmation = String(form.get("confirmation") || "");
+    const feedback = document.getElementById("passwordRecoveryFeedback");
+
+    if (password !== confirmation) {
+      feedback.textContent = "Le password non coincidono.";
+      return;
+    }
+
+    const { data, error: sessionError } = await remoteArchive.auth.getUser();
+    if (sessionError || !data.user) {
+      feedback.textContent = "Il link non e piu valido. Richiedine uno nuovo.";
+      return;
+    }
+
+    const { error } = await remoteArchive.auth.updateUser({ password });
+    if (error) {
+      feedback.textContent = error.message || "Impossibile impostare la password.";
+      return;
+    }
+
+    recoverySessionPending = false;
+    window.history.replaceState({}, "", `${window.location.pathname}#creator`);
+    await refreshRemoteSession();
+    route();
+    toast("Password impostata.");
   });
 }
 
