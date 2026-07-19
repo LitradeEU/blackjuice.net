@@ -4,8 +4,9 @@ import { supabaseConfig } from "./supabase-config.js";
 const STORAGE_KEY = "blackjuice.posts.v1";
 const ANALYTICS_KEY = "blackjuice.analytics.v1";
 const DRAFT_KEY = "blackjuice.creatorDraft.v1";
+const COVER_MAX_BYTES = 2 * 1024 * 1024;
 const COVER_MAX_EDGE = 1600;
-const COVER_MAX_DATA_URL_LENGTH = 2_400_000;
+const COVER_MAX_DATA_URL_LENGTH = 2_796_250;
 const STORAGE_DATABASE = "blackjuice.creator.v1";
 const STORAGE_OBJECT_STORE = "values";
 const volatileStorage = new Map();
@@ -147,6 +148,9 @@ async function publishRemotePost(post, file) {
 async function uploadRemoteCover(post, file) {
   const source = file || (post.image.startsWith("data:") ? await dataUrlToBlob(post.image) : null);
   if (!source) return post.image;
+  if (source.size > COVER_MAX_BYTES) {
+    throw new Error("La copertina non puo superare 2 MB.");
+  }
 
   const extension = coverExtension(source.type);
   const path = `posts/${post.id}-${Date.now()}.${extension}`;
@@ -970,9 +974,7 @@ function normalizeArticleText(value = "") {
 }
 
 async function createCoverDataUrl(file) {
-  if (!file.type.startsWith("image/")) {
-    throw new Error("Scegli un file immagine per la copertina.");
-  }
+  validateCoverFile(file);
 
   if (file.type === "image/gif" || file.type === "image/svg+xml" || !("createImageBitmap" in window)) {
     const dataUrl = await readFileAsDataUrl(file);
@@ -995,6 +997,16 @@ async function createCoverDataUrl(file) {
     throw new Error("L'immagine e troppo grande per essere salvata nel browser. Usa una copertina piu leggera.");
   }
   return dataUrl;
+}
+
+function validateCoverFile(file) {
+  if (!file.type.startsWith("image/")) {
+    throw new Error("Scegli un file immagine per la copertina.");
+  }
+
+  if (file.size > COVER_MAX_BYTES) {
+    throw new Error("La copertina non puo superare 2 MB.");
+  }
 }
 
 function readFileAsDataUrl(file) {
