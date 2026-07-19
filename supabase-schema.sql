@@ -44,6 +44,8 @@ for select
 to authenticated
 using (auth.uid() = user_id);
 
+grant select on public.creators to authenticated;
+
 create policy "published posts are public"
 on public.posts
 for select
