@@ -1,3 +1,6 @@
+import { createClient } from "@supabase/supabase-js";
+import { supabaseConfig } from "./supabase-config.js";
+
 const STORAGE_KEY = "blackjuice.posts.v1";
 const ANALYTICS_KEY = "blackjuice.analytics.v1";
 const DRAFT_KEY = "blackjuice.creatorDraft.v1";
@@ -10,6 +13,11 @@ const STORAGE_DATABASE = "blackjuice.creator.v1";
 const STORAGE_OBJECT_STORE = "values";
 const volatileStorage = new Map();
 let storageDatabasePromise = null;
+const remoteArchive = isRemoteConfigured()
+  ? createClient(supabaseConfig.url, supabaseConfig.publishableKey, {
+      auth: { detectSessionInUrl: false },
+    })
+  : null;
 
 const demoPostIds = new Set([
   "manifesto-liquido",
@@ -22,9 +30,145 @@ let appState = {
   posts: [],
   analytics: { events: [] },
   draft: null,
+  remote: { email: "", authenticated: false, isCreator: false },
   currentPostId: null,
   routeStartedAt: Date.now(),
 };
+
+function isRemoteConfigured() {
+  return Boolean(supabaseConfig.url && supabaseConfig.publishableKey);
+}
+
+async function refreshRemoteSession() {
+  if (!remoteArchive) return appState.remote;
+
+  const { data } = await remoteArchive.auth.getSession();
+  const user = data.session?.user;
+  if (!user) {
+    appState.remote = { email: "", authenticated: false, isCreator: false };
+    return appState.remote;
+  }
+
+  const { data: membership } = await remoteArchive
+    .from("creators")
+    .select("user_id")
+    .eq("user_id", user.id)
+    .maybeSingle();
+
+  appState.remote = { email: user.email || "", authenticated: true, isCreator: Boolean(membership) };
+  return appState.remote;
+}
+
+async function loadRemotePosts() {
+  if (!remoteArchive) return [];
+
+  const { data, error } = await remoteArchive
+    .from("posts")
+    .select("*")
+    .order("published_date", { ascending: false })
+    .order("published_time", { ascending: false });
+
+  if (error || !data) return [];
+  return data.map(remoteRowToPost);
+}
+
+function mergePosts(localPosts, remotePosts) {
+  const byId = new Map(remotePosts.map((post) => [post.id, post]));
+
+  localPosts.forEach((post) => {
+    if (post.status === "draft" || !byId.has(post.id)) byId.set(post.id, post);
+  });
+
+  return [...byId.values()];
+}
+
+function remoteRowToPost(row) {
+  return {
+    id: row.id,
+    status: row.status,
+    title: row.title,
+    subtitle: row.subtitle || "",
+    category: row.category || "",
+    collection: row.collection_name || "",
+    author: row.author || "",
+    date: row.published_date,
+    time: String(row.published_time || "").slice(0, 5),
+    place: row.place || "",
+    readingMinutes: row.reading_minutes || 1,
+    accent: row.accent || "#111111",
+    coverTone: row.cover_tone || "ink",
+    image: row.image_url || "",
+    links: Array.isArray(row.links) ? row.links : [],
+    body: row.body || "",
+  };
+}
+
+function postToRemoteRow(post) {
+  return {
+    id: post.id,
+    status: post.status,
+    title: post.title,
+    subtitle: post.subtitle || "",
+    category: post.category || "",
+    collection_name: post.collection || "",
+    author: post.author || "",
+    published_date: post.date,
+    published_time: post.time || null,
+    place: post.place || "",
+    reading_minutes: post.readingMinutes || 1,
+    accent: post.accent || "#111111",
+    cover_tone: post.coverTone || "ink",
+    image_url: post.image || "",
+    links: post.links || [],
+    body: post.body,
+    updated_at: new Date().toISOString(),
+  };
+}
+
+async function publishRemotePost(post, file) {
+  if (!remoteArchive) throw new Error("Archivio remoto non configurato.");
+  const remote = await refreshRemoteSession();
+  if (!remote.isCreator) throw new Error("Accedi all'archivio remoto prima di pubblicare.");
+
+  const image = await uploadRemoteCover(post, file);
+  const remotePost = { ...post, image };
+  const { data, error } = await remoteArchive
+    .from("posts")
+    .upsert(postToRemoteRow(remotePost), { onConflict: "id" })
+    .select()
+    .single();
+
+  if (error) throw new Error(error.message || "Impossibile pubblicare.");
+  return remoteRowToPost(data);
+}
+
+async function uploadRemoteCover(post, file) {
+  const source = file || (post.image.startsWith("data:") ? await dataUrlToBlob(post.image) : null);
+  if (!source) return post.image;
+
+  const extension = coverExtension(source.type);
+  const path = `posts/${post.id}-${Date.now()}.${extension}`;
+  const { error } = await remoteArchive.storage.from("covers").upload(path, source, {
+    contentType: source.type || "image/webp",
+    upsert: false,
+  });
+
+  if (error) throw new Error(error.message || "Impossibile caricare la copertina.");
+  return remoteArchive.storage.from("covers").getPublicUrl(path).data.publicUrl;
+}
+
+async function dataUrlToBlob(value) {
+  const response = await fetch(value);
+  return response.blob();
+}
+
+function coverExtension(type = "") {
+  if (type === "image/png") return "png";
+  if (type === "image/jpeg") return "jpg";
+  if (type === "image/gif") return "gif";
+  if (type === "image/svg+xml") return "svg";
+  return "webp";
+}
 
 async function loadPosts() {
   const stored = await readPersistentJson(STORAGE_KEY);
@@ -616,6 +760,8 @@ function renderCreator() {
         </aside>
       </section>
 
+      ${remoteArchiveMarkup()}
+
       <section class="library-panel" id="library" data-reveal>
         <div class="section-heading">
           <p class="eyebrow">Library</p>
@@ -854,6 +1000,44 @@ function creatorPreview(post) {
   `;
 }
 
+function remoteArchiveMarkup() {
+  if (!remoteArchive) return "";
+
+  if (appState.remote.authenticated) {
+    return `
+      <section class="remote-archive-panel" data-reveal>
+        <div>
+          <p class="eyebrow">Archivio remoto</p>
+          <h2>${escapeHtml(appState.remote.email)}</h2>
+        </div>
+        <button class="pill-button ghost" type="button" id="remoteSignOut">Esci</button>
+      </section>
+    `;
+  }
+
+  return `
+    <section class="remote-archive-panel" data-reveal>
+      <div class="panel-heading">
+        <div>
+          <p class="eyebrow">Archivio remoto</p>
+          <h2>Accesso</h2>
+        </div>
+      </div>
+      <form class="remote-auth-form" id="remoteAuthForm">
+        <label class="field">
+          <span>Email</span>
+          <input name="email" type="email" autocomplete="email" required>
+        </label>
+        <label class="field">
+          <span>Password</span>
+          <input name="password" type="password" autocomplete="current-password" required>
+        </label>
+        <button class="pill-button light" type="submit">Accedi</button>
+      </form>
+    </section>
+  `;
+}
+
 function libraryRow(post) {
   const details = [formatDate(post.date), post.collection, post.category, post.place || "Nessun luogo"]
     .filter(Boolean)
@@ -1010,9 +1194,35 @@ function bindCreator() {
       });
   });
 
-  creatorShell.addEventListener("click", (event) => {
+  document.getElementById("remoteAuthForm")?.addEventListener("submit", async (event) => {
+    event.preventDefault();
+    const data = new FormData(event.currentTarget);
+    const { error } = await remoteArchive.auth.signInWithPassword({
+      email: String(data.get("email") || "").trim(),
+      password: String(data.get("password") || ""),
+    });
+
+    if (error) {
+      toast(error.message || "Accesso non riuscito.");
+      return;
+    }
+
+    const remote = await refreshRemoteSession();
+    renderCreator();
+    toast(remote.isCreator ? "Archivio remoto connesso." : "Account senza permessi di pubblicazione.");
+  });
+
+  creatorShell.addEventListener("click", async (event) => {
     const button = event.target.closest?.("button");
     if (!button) return;
+
+    if (button.id === "remoteSignOut") {
+      await remoteArchive.auth.signOut();
+      await refreshRemoteSession();
+      renderCreator();
+      toast("Disconnesso dall'archivio remoto.");
+      return;
+    }
 
     if (button.id === "saveDraft") {
       const draft = getFormDraft(form);
@@ -1033,6 +1243,21 @@ function bindCreator() {
         toast("Titolo e testo sono necessari per pubblicare.");
         return;
       }
+
+      if (remoteArchive) {
+        try {
+          const remotePost = await publishRemotePost(post, fileInput.files?.[0]);
+          upsertPost(remotePost);
+          removeJson(DRAFT_KEY);
+          window.location.hash = `#post/${remotePost.id}`;
+          toast("Pubblicazione online.");
+        } catch (error) {
+          upsertPost(post);
+          toast(error.message || "Impossibile pubblicare.");
+        }
+        return;
+      }
+
       const postPersisted = upsertPost(post);
       removeJson(DRAFT_KEY);
       window.location.hash = `#post/${post.id}`;
@@ -1061,6 +1286,19 @@ function bindCreator() {
       const post = appState.posts.find((item) => item.id === button.dataset.toggle);
       if (!post) return;
       post.status = post.status === "published" ? "draft" : "published";
+
+      if (remoteArchive) {
+        try {
+          const remotePost = await publishRemotePost(post, null);
+          upsertPost(remotePost);
+        } catch (error) {
+          post.status = post.status === "published" ? "draft" : "published";
+          persistPosts();
+          toast(error.message || "Impossibile aggiornare la pubblicazione.");
+          return;
+        }
+      }
+
       const postPersisted = persistPosts();
       renderCreator();
       toast(postPersisted ? "Stato aggiornato." : storageWarning());
@@ -1173,9 +1411,12 @@ window.addEventListener("scroll", requestScrollMotionUpdate, { passive: true });
 window.addEventListener("resize", requestScrollMotionUpdate);
 
 async function bootstrapApp() {
-  appState.posts = await loadPosts();
+  const localPosts = await loadPosts();
   appState.analytics = await loadAnalytics();
   appState.draft = await readPersistentJson(DRAFT_KEY);
+  await refreshRemoteSession();
+  const remotePosts = await loadRemotePosts();
+  appState.posts = mergePosts(localPosts, remotePosts);
 
   writeJson(STORAGE_KEY, appState.posts);
   writeJson(ANALYTICS_KEY, appState.analytics);
