@@ -55,13 +55,9 @@ async function refreshRemoteSession() {
     return appState.remote;
   }
 
-  const { data: membership } = await remoteArchive
-    .from("creators")
-    .select("user_id")
-    .eq("user_id", user.id)
-    .maybeSingle();
+  const { data: isCreator } = await remoteArchive.rpc("is_creator");
 
-  appState.remote = { email: user.email || "", authenticated: true, isCreator: Boolean(membership) };
+  appState.remote = { email: user.email || "", authenticated: true, isCreator: Boolean(isCreator) };
   return appState.remote;
 }
 
