@@ -4,6 +4,9 @@ const DRAFT_KEY = "blackjuice.creatorDraft.v1";
 const CREATOR_SESSION_KEY = "blackjuice.creatorSession.v1";
 const CREATOR_PASSWORD_HASH = "e92674ce3b32871686eec4b520726b13e56a149cbd8af0d78f4737f486ea2487";
 const CREATOR_SESSION_DURATION = 12 * 60 * 60 * 1000;
+const COVER_MAX_EDGE = 1600;
+const COVER_MAX_DATA_URL_LENGTH = 2_400_000;
+const volatileStorage = new Map();
 
 const demoPostIds = new Set([
   "manifesto-liquido",
@@ -44,22 +47,40 @@ function loadAnalytics() {
 
 function readJson(key) {
   try {
-    return JSON.parse(localStorage.getItem(key));
+    const stored = localStorage.getItem(key);
+    if (stored !== null) return JSON.parse(stored);
   } catch (error) {
-    return null;
+    // Fall through to session-only data when browser storage is unavailable.
   }
+  return volatileStorage.get(key) ?? null;
 }
 
 function writeJson(key, value) {
-  localStorage.setItem(key, JSON.stringify(value));
+  try {
+    localStorage.setItem(key, JSON.stringify(value));
+    volatileStorage.delete(key);
+    return true;
+  } catch (error) {
+    volatileStorage.set(key, value);
+    return false;
+  }
+}
+
+function removeJson(key) {
+  volatileStorage.delete(key);
+  try {
+    localStorage.removeItem(key);
+  } catch (error) {
+    // The in-memory copy is already removed.
+  }
 }
 
 function persistPosts() {
-  writeJson(STORAGE_KEY, appState.posts);
+  return writeJson(STORAGE_KEY, appState.posts);
 }
 
 function persistAnalytics() {
-  writeJson(ANALYTICS_KEY, appState.analytics);
+  return writeJson(ANALYTICS_KEY, appState.analytics);
 }
 
 function publishedPosts() {
@@ -589,6 +610,50 @@ function normalizeArticleText(value = "") {
     .replace(/\n{3,}/g, "\n\n");
 }
 
+async function createCoverDataUrl(file) {
+  if (!file.type.startsWith("image/")) {
+    throw new Error("Scegli un file immagine per la copertina.");
+  }
+
+  if (file.type === "image/gif" || file.type === "image/svg+xml" || !("createImageBitmap" in window)) {
+    const dataUrl = await readFileAsDataUrl(file);
+    if (dataUrl.length > COVER_MAX_DATA_URL_LENGTH) {
+      throw new Error("L'immagine e troppo grande per essere salvata nel browser. Usa una copertina piu leggera.");
+    }
+    return dataUrl;
+  }
+
+  const bitmap = await createImageBitmap(file);
+  const scale = Math.min(1, COVER_MAX_EDGE / Math.max(bitmap.width, bitmap.height));
+  const canvas = document.createElement("canvas");
+  canvas.width = Math.max(1, Math.round(bitmap.width * scale));
+  canvas.height = Math.max(1, Math.round(bitmap.height * scale));
+  canvas.getContext("2d").drawImage(bitmap, 0, 0, canvas.width, canvas.height);
+  bitmap.close?.();
+
+  const dataUrl = canvas.toDataURL("image/webp", 0.82);
+  if (dataUrl.length > COVER_MAX_DATA_URL_LENGTH) {
+    throw new Error("L'immagine e troppo grande per essere salvata nel browser. Usa una copertina piu leggera.");
+  }
+  return dataUrl;
+}
+
+function readFileAsDataUrl(file) {
+  return new Promise((resolve, reject) => {
+    const reader = new FileReader();
+    reader.onload = () => {
+      if (typeof reader.result === "string") resolve(reader.result);
+      else reject(new Error("Impossibile leggere l'immagine selezionata."));
+    };
+    reader.onerror = () => reject(new Error("Impossibile leggere l'immagine selezionata."));
+    reader.readAsDataURL(file);
+  });
+}
+
+function storageWarning() {
+  return "Spazio browser insufficiente: la modifica resta attiva solo in questa sessione.";
+}
+
 function categoryAccent(category = "") {
   const key = category.toLowerCase();
   if (key.includes("metodo")) return "#2f6f64";
@@ -751,6 +816,7 @@ function bindCreator() {
   const previewRoot = document.getElementById("livePreview");
   const fileInput = form.elements.image;
   const bodyInput = form.elements.body;
+  const creatorShell = document.querySelector(".creator-shell");
   const savedDraft = readJson(DRAFT_KEY);
   if (savedDraft?.image) {
     form.dataset.coverImage = savedDraft.image;
@@ -782,65 +848,75 @@ function bindCreator() {
   fileInput.addEventListener("change", () => {
     const file = fileInput.files?.[0];
     if (!file) return;
-    const reader = new FileReader();
-    reader.onload = () => {
-      form.dataset.coverImage = reader.result;
+
+    createCoverDataUrl(file)
+      .then((image) => {
+        form.dataset.coverImage = image;
+        const draft = getFormDraft(form);
+        previewRoot.innerHTML = creatorPreview(draft);
+        if (!writeJson(DRAFT_KEY, draft)) toast(storageWarning());
+      })
+      .catch((error) => {
+        fileInput.value = "";
+        toast(error.message);
+      });
+  });
+
+  creatorShell.addEventListener("click", (event) => {
+    const button = event.target.closest?.("button");
+    if (!button) return;
+
+    if (button.id === "saveDraft") {
       const draft = getFormDraft(form);
-      previewRoot.innerHTML = creatorPreview(draft);
-      writeJson(DRAFT_KEY, draft);
-    };
-    reader.readAsDataURL(file);
-  });
-
-  document.getElementById("saveDraft").addEventListener("click", () => {
-    const draft = getFormDraft(form);
-    if (!draft.title) {
-      toast("Aggiungi un titolo prima di salvare.");
+      if (!draft.title) {
+        toast("Aggiungi un titolo prima di salvare.");
+        return;
+      }
+      const postPersisted = upsertPost(draft);
+      const draftPersisted = writeJson(DRAFT_KEY, draft);
+      renderCreator();
+      toast(postPersisted && draftPersisted ? "Bozza salvata." : storageWarning());
       return;
     }
-    upsertPost(draft);
-    writeJson(DRAFT_KEY, draft);
-    renderCreator();
-    toast("Bozza salvata.");
-  });
 
-  document.getElementById("publishPost").addEventListener("click", () => {
-    const post = { ...getFormDraft(form), status: "published" };
-    if (!post.title || !post.body) {
-      toast("Titolo e testo sono necessari per pubblicare.");
+    if (button.id === "publishPost") {
+      const post = { ...getFormDraft(form), status: "published" };
+      if (!post.title || !post.body) {
+        toast("Titolo e testo sono necessari per pubblicare.");
+        return;
+      }
+      const postPersisted = upsertPost(post);
+      removeJson(DRAFT_KEY);
+      window.location.hash = `#post/${post.id}`;
+      toast(postPersisted ? "Pubblicazione online nella preview." : storageWarning());
       return;
     }
-    upsertPost(post);
-    localStorage.removeItem(DRAFT_KEY);
-    window.location.hash = `#post/${post.id}`;
-    toast("Pubblicazione online nella preview.");
-  });
 
-  document.getElementById("resetDraft").addEventListener("click", () => {
-    localStorage.removeItem(DRAFT_KEY);
-    renderCreator();
-    toast("Nuova bozza pronta.");
-  });
+    if (button.id === "resetDraft") {
+      removeJson(DRAFT_KEY);
+      renderCreator();
+      toast("Nuova bozza pronta.");
+      return;
+    }
 
-  document.querySelectorAll("[data-edit]").forEach((button) => {
-    button.addEventListener("click", () => {
+    if (button.dataset.edit) {
       const post = appState.posts.find((item) => item.id === button.dataset.edit);
       if (!post) return;
-      writeJson(DRAFT_KEY, post);
+      const draftPersisted = writeJson(DRAFT_KEY, post);
       renderCreator();
       document.getElementById("composer")?.scrollIntoView({ behavior: "smooth" });
-    });
-  });
+      toast(draftPersisted ? "Bozza pronta per la modifica." : storageWarning());
+      return;
+    }
 
-  document.querySelectorAll("[data-toggle]").forEach((button) => {
-    button.addEventListener("click", () => {
+    if (button.dataset.toggle) {
       const post = appState.posts.find((item) => item.id === button.dataset.toggle);
       if (!post) return;
       post.status = post.status === "published" ? "draft" : "published";
-      persistPosts();
+      const postPersisted = persistPosts();
       renderCreator();
-      toast("Stato aggiornato.");
-    });
+      toast(postPersisted ? "Stato aggiornato." : storageWarning());
+    }
   });
 
   document.getElementById("analyticsSpan").addEventListener("change", (event) => {
@@ -855,7 +931,7 @@ function upsertPost(post) {
   } else {
     appState.posts.unshift(post);
   }
-  persistPosts();
+  return persistPosts();
 }
 
 function bindGlobalNav() {
