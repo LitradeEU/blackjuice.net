@@ -6,7 +6,10 @@ const CREATOR_PASSWORD_HASH = "e92674ce3b32871686eec4b520726b13e56a149cbd8af0d78
 const CREATOR_SESSION_DURATION = 12 * 60 * 60 * 1000;
 const COVER_MAX_EDGE = 1600;
 const COVER_MAX_DATA_URL_LENGTH = 2_400_000;
+const STORAGE_DATABASE = "blackjuice.creator.v1";
+const STORAGE_OBJECT_STORE = "values";
 const volatileStorage = new Map();
+let storageDatabasePromise = null;
 
 const demoPostIds = new Set([
   "manifesto-liquido",
@@ -16,14 +19,15 @@ const demoPostIds = new Set([
 ]);
 
 let appState = {
-  posts: loadPosts(),
-  analytics: loadAnalytics(),
+  posts: [],
+  analytics: { events: [] },
+  draft: null,
   currentPostId: null,
   routeStartedAt: Date.now(),
 };
 
-function loadPosts() {
-  const stored = readJson(STORAGE_KEY);
+async function loadPosts() {
+  const stored = await readPersistentJson(STORAGE_KEY);
   if (Array.isArray(stored)) {
     const posts = stored.filter((post) => !demoPostIds.has(post.id));
     if (posts.length !== stored.length) writeJson(STORAGE_KEY, posts);
@@ -33,8 +37,8 @@ function loadPosts() {
   return [];
 }
 
-function loadAnalytics() {
-  const stored = readJson(ANALYTICS_KEY);
+async function loadAnalytics() {
+  const stored = await readPersistentJson(ANALYTICS_KEY);
   if (stored && Array.isArray(stored.events)) {
     const events = stored.events.filter((event) => !demoPostIds.has(event.postId));
     if (events.length !== stored.events.length) writeJson(ANALYTICS_KEY, { events });
@@ -55,24 +59,97 @@ function readJson(key) {
   return volatileStorage.get(key) ?? null;
 }
 
+async function readPersistentJson(key) {
+  const indexedValue = await readIndexedJson(key);
+  return indexedValue ?? readJson(key);
+}
+
 function writeJson(key, value) {
+  volatileStorage.set(key, value);
+  if (key === DRAFT_KEY) appState.draft = value;
+
+  let storedLocally = false;
   try {
     localStorage.setItem(key, JSON.stringify(value));
     volatileStorage.delete(key);
-    return true;
+    storedLocally = true;
   } catch (error) {
-    volatileStorage.set(key, value);
-    return false;
+    // IndexedDB handles larger creator payloads, including cover images.
   }
+
+  void writeIndexedJson(key, value);
+  return storedLocally || supportsIndexedDb();
 }
 
 function removeJson(key) {
   volatileStorage.delete(key);
+  if (key === DRAFT_KEY) appState.draft = null;
   try {
     localStorage.removeItem(key);
   } catch (error) {
     // The in-memory copy is already removed.
   }
+  void removeIndexedJson(key);
+}
+
+function supportsIndexedDb() {
+  return typeof window !== "undefined" && "indexedDB" in window;
+}
+
+function openStorageDatabase() {
+  if (!supportsIndexedDb()) return Promise.resolve(null);
+  if (storageDatabasePromise) return storageDatabasePromise;
+
+  storageDatabasePromise = new Promise((resolve) => {
+    const request = window.indexedDB.open(STORAGE_DATABASE, 1);
+    request.onupgradeneeded = () => {
+      if (!request.result.objectStoreNames.contains(STORAGE_OBJECT_STORE)) {
+        request.result.createObjectStore(STORAGE_OBJECT_STORE);
+      }
+    };
+    request.onsuccess = () => resolve(request.result);
+    request.onerror = () => resolve(null);
+    request.onblocked = () => resolve(null);
+  });
+
+  return storageDatabasePromise;
+}
+
+async function readIndexedJson(key) {
+  const database = await openStorageDatabase();
+  if (!database) return null;
+
+  return new Promise((resolve) => {
+    const request = database.transaction(STORAGE_OBJECT_STORE, "readonly").objectStore(STORAGE_OBJECT_STORE).get(key);
+    request.onsuccess = () => resolve(request.result ?? null);
+    request.onerror = () => resolve(null);
+  });
+}
+
+async function writeIndexedJson(key, value) {
+  const database = await openStorageDatabase();
+  if (!database) return false;
+
+  return new Promise((resolve) => {
+    const transaction = database.transaction(STORAGE_OBJECT_STORE, "readwrite");
+    transaction.objectStore(STORAGE_OBJECT_STORE).put(value, key);
+    transaction.oncomplete = () => resolve(true);
+    transaction.onerror = () => resolve(false);
+    transaction.onabort = () => resolve(false);
+  });
+}
+
+async function removeIndexedJson(key) {
+  const database = await openStorageDatabase();
+  if (!database) return false;
+
+  return new Promise((resolve) => {
+    const transaction = database.transaction(STORAGE_OBJECT_STORE, "readwrite");
+    transaction.objectStore(STORAGE_OBJECT_STORE).delete(key);
+    transaction.oncomplete = () => resolve(true);
+    transaction.onerror = () => resolve(false);
+    transaction.onabort = () => resolve(false);
+  });
 }
 
 function persistPosts() {
@@ -455,7 +532,7 @@ function renderPost(postId) {
 function renderCreator() {
   trackRouteLeave();
   appState.currentPostId = null;
-  const draft = readJson(DRAFT_KEY) || createEmptyDraft();
+  const draft = appState.draft || readJson(DRAFT_KEY) || createEmptyDraft();
   const metrics = computeMetrics(30);
 
   mount(`
@@ -888,7 +965,7 @@ function bindCreator() {
   const fileInput = form.elements.image;
   const bodyInput = form.elements.body;
   const creatorShell = document.querySelector(".creator-shell");
-  const savedDraft = readJson(DRAFT_KEY);
+  const savedDraft = appState.draft || readJson(DRAFT_KEY);
   if (savedDraft?.image) {
     form.dataset.coverImage = savedDraft.image;
   }
@@ -959,7 +1036,7 @@ function bindCreator() {
       const postPersisted = upsertPost(post);
       removeJson(DRAFT_KEY);
       window.location.hash = `#post/${post.id}`;
-      toast(postPersisted ? "Pubblicazione online nella preview." : storageWarning());
+      toast(postPersisted ? "Pubblicazione salvata sul dispositivo." : storageWarning());
       return;
     }
 
@@ -1094,4 +1171,16 @@ window.addEventListener("hashchange", route);
 window.addEventListener("beforeunload", trackRouteLeave);
 window.addEventListener("scroll", requestScrollMotionUpdate, { passive: true });
 window.addEventListener("resize", requestScrollMotionUpdate);
-route();
+
+async function bootstrapApp() {
+  appState.posts = await loadPosts();
+  appState.analytics = await loadAnalytics();
+  appState.draft = await readPersistentJson(DRAFT_KEY);
+
+  writeJson(STORAGE_KEY, appState.posts);
+  writeJson(ANALYTICS_KEY, appState.analytics);
+  if (appState.draft) writeJson(DRAFT_KEY, appState.draft);
+  route();
+}
+
+bootstrapApp();
