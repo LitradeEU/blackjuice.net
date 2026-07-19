@@ -6,6 +6,10 @@
     "build": "node scripts/build.mjs"
   },
   "devDependencies": {
+    "pg": "^8.22.0",
     "vite": "8.1.5"
+  },
+  "dependencies": {
+    "@supabase/supabase-js": "^2.110.7"
   }
 }
